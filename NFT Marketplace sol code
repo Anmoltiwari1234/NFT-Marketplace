@@ -1,0 +1,37 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.20;
+
+interface IERC721 {
+    function transferFrom(address from, address to, uint256 tokenId) external;
+}
+
+contract NFTMarketplace {
+    struct Listing {
+        address seller;
+        uint256 price;
+    }
+
+    mapping(address => mapping(uint256 => Listing)) public listings;
+
+    event NFTListed(address indexed nftAddress, uint256 indexed tokenId, address seller, uint256 price);
+    event NFTPurchased(address indexed nftAddress, uint256 indexed tokenId, address buyer, uint256 price);
+
+    function listNFT(address nftAddress, uint256 tokenId, uint256 price) external {
+        require(price > 0, "Price must be greater than zero");
+        IERC721(nftAddress).transferFrom(msg.sender, address(this), tokenId);
+        listings[nftAddress][tokenId] = Listing(msg.sender, price);
+        emit NFTListed(nftAddress, tokenId, msg.sender, price);
+    }
+
+    function purchaseNFT(address nftAddress, uint256 tokenId) external payable {
+        Listing memory item = listings[nftAddress][tokenId];
+        require(msg.value >= item.price, "Insufficient payment");
+        require(item.seller != address(0), "NFT not listed");
+
+        delete listings[nftAddress][tokenId];
+
+        payable(item.seller).transfer(item.price);
+        IERC721(nftAddress).transferFrom(address(this), msg.sender, tokenId);
+        emit NFTPurchased(nftAddress, tokenId, msg.sender, item.price);
+    }
+}
