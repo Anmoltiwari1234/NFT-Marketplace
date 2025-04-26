@@ -27,12 +27,23 @@ contract NFTMarketplace is ReentrancyGuard {
         uint256 price;
     }
 
+    address public owner;
+    bool public isPaused = false;
+
     mapping(address => mapping(uint256 => Listing)) public listings;
 
     event NFTListed(address indexed nftAddress, uint256 indexed tokenId, address seller, uint256 price);
     event NFTPurchased(address indexed nftAddress, uint256 indexed tokenId, address buyer, uint256 price);
     event NFTListingCancelled(address indexed nftAddress, uint256 indexed tokenId);
     event NFTPriceUpdated(address indexed nftAddress, uint256 indexed tokenId, uint256 newPrice);
+    event MarketplacePaused();
+    event MarketplaceUnpaused();
+    event Withdrawn(address indexed receiver, uint256 amount);
+
+    modifier onlyOwner() {
+        require(msg.sender == owner, "Not the owner");
+        _;
+    }
 
     modifier onlySeller(address nftAddress, uint256 tokenId) {
         require(listings[nftAddress][tokenId].seller == msg.sender, "Not the seller");
@@ -44,14 +55,34 @@ contract NFTMarketplace is ReentrancyGuard {
         _;
     }
 
-    function listNFT(address nftAddress, uint256 tokenId, uint256 price) external {
+    modifier notPaused() {
+        require(!isPaused, "Marketplace is paused");
+        _;
+    }
+
+    constructor() {
+        owner = msg.sender;
+    }
+
+    function listNFT(address nftAddress, uint256 tokenId, uint256 price) external notPaused {
         require(price > 0, "Price must be greater than zero");
         IERC721(nftAddress).transferFrom(msg.sender, address(this), tokenId);
         listings[nftAddress][tokenId] = Listing(msg.sender, price);
         emit NFTListed(nftAddress, tokenId, msg.sender, price);
     }
 
-    function purchaseNFT(address nftAddress, uint256 tokenId) external payable nonReentrant isListed(nftAddress, tokenId) {
+    function bulkListNFTs(address nftAddress, uint256[] calldata tokenIds, uint256[] calldata prices) external notPaused {
+        require(tokenIds.length == prices.length, "Mismatched input lengths");
+
+        for (uint256 i = 0; i < tokenIds.length; i++) {
+            require(prices[i] > 0, "Price must be greater than zero");
+            IERC721(nftAddress).transferFrom(msg.sender, address(this), tokenIds[i]);
+            listings[nftAddress][tokenIds[i]] = Listing(msg.sender, prices[i]);
+            emit NFTListed(nftAddress, tokenIds[i], msg.sender, prices[i]);
+        }
+    }
+
+    function purchaseNFT(address nftAddress, uint256 tokenId) external payable nonReentrant isListed(nftAddress, tokenId) notPaused {
         Listing memory item = listings[nftAddress][tokenId];
         require(msg.value >= item.price, "Insufficient payment");
 
@@ -59,7 +90,6 @@ contract NFTMarketplace is ReentrancyGuard {
 
         payable(item.seller).transfer(item.price);
 
-        // Refund excess payment
         if (msg.value > item.price) {
             payable(msg.sender).transfer(msg.value - item.price);
         }
@@ -82,5 +112,26 @@ contract NFTMarketplace is ReentrancyGuard {
 
     function getListing(address nftAddress, uint256 tokenId) external view returns (Listing memory) {
         return listings[nftAddress][tokenId];
+    }
+
+    function isNFTListed(address nftAddress, uint256 tokenId) external view returns (bool) {
+        return listings[nftAddress][tokenId].seller != address(0);
+    }
+
+    function pauseMarketplace() external onlyOwner {
+        isPaused = true;
+        emit MarketplacePaused();
+    }
+
+    function unpauseMarketplace() external onlyOwner {
+        isPaused = false;
+        emit MarketplaceUnpaused();
+    }
+
+    function withdraw() external onlyOwner {
+        uint256 balance = address(this).balance;
+        require(balance > 0, "Nothing to withdraw");
+        payable(owner).transfer(balance);
+        emit Withdrawn(owner, balance);
     }
 }
