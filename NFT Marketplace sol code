@@ -4,17 +4,23 @@ pragma solidity ^0.8.20;
 interface IERC721 {
     function transferFrom(address from, address to, uint256 tokenId) external;
     function ownerOf(uint256 tokenId) external view returns (address);
+    function isApprovedForAll(address owner, address operator) external view returns (bool);
+    function getApproved(uint256 tokenId) external view returns (address);
+}
+
+interface IERC721Receiver {
+    function onERC721Received(address, address, uint256, bytes calldata) external returns (bytes4);
+}
+
+interface IERC2981 {
+    function royaltyInfo(uint256 tokenId, uint256 salePrice) external view returns (address, uint256);
 }
 
 abstract contract ReentrancyGuard {
     uint256 private _status;
-
-    constructor() {
-        _status = 1;
-    }
-
+    constructor() { _status = 1; }
     modifier nonReentrant() {
-        require(_status != 2, "ReentrancyGuard: reentrant call");
+        require(_status != 2, "Reentrant call");
         _status = 2;
         _;
         _status = 1;
@@ -28,9 +34,12 @@ contract NFTMarketplace is ReentrancyGuard {
     }
 
     address public owner;
-    bool public isPaused = false;
+    bool public isPaused;
+    uint256 public feePercent = 250; // 2.5%
+    address public feeRecipient;
 
     mapping(address => mapping(uint256 => Listing)) public listings;
+    mapping(address => bool) public supportsRoyalty;
 
     event NFTListed(address indexed nftAddress, uint256 indexed tokenId, address seller, uint256 price);
     event NFTPurchased(address indexed nftAddress, uint256 indexed tokenId, address buyer, uint256 price);
@@ -39,84 +48,96 @@ contract NFTMarketplace is ReentrancyGuard {
     event MarketplacePaused();
     event MarketplaceUnpaused();
     event Withdrawn(address indexed receiver, uint256 amount);
+    event FeeUpdated(uint256 newFee);
+    event FeeRecipientUpdated(address newRecipient);
 
     modifier onlyOwner() {
-        require(msg.sender == owner, "Not the owner");
+        require(msg.sender == owner, "Not owner");
         _;
     }
 
-    modifier onlySeller(address nftAddress, uint256 tokenId) {
-        require(listings[nftAddress][tokenId].seller == msg.sender, "Not the seller");
+    modifier onlySeller(address nft, uint256 tokenId) {
+        require(listings[nft][tokenId].seller == msg.sender, "Not seller");
         _;
     }
 
-    modifier isListed(address nftAddress, uint256 tokenId) {
-        require(listings[nftAddress][tokenId].seller != address(0), "NFT not listed");
+    modifier isListed(address nft, uint256 tokenId) {
+        require(listings[nft][tokenId].seller != address(0), "Not listed");
         _;
     }
 
     modifier notPaused() {
-        require(!isPaused, "Marketplace is paused");
+        require(!isPaused, "Marketplace paused");
         _;
     }
 
     constructor() {
         owner = msg.sender;
+        feeRecipient = msg.sender;
     }
 
-    function listNFT(address nftAddress, uint256 tokenId, uint256 price) external notPaused {
-        require(price > 0, "Price must be greater than zero");
-        IERC721(nftAddress).transferFrom(msg.sender, address(this), tokenId);
-        listings[nftAddress][tokenId] = Listing(msg.sender, price);
-        emit NFTListed(nftAddress, tokenId, msg.sender, price);
+    // === LISTING FUNCTIONS ===
+
+    function listNFT(address nft, uint256 tokenId, uint256 price) external notPaused {
+        require(price > 0, "Price must be > 0");
+        IERC721(nft).transferFrom(msg.sender, address(this), tokenId);
+        listings[nft][tokenId] = Listing(msg.sender, price);
+        emit NFTListed(nft, tokenId, msg.sender, price);
     }
 
-    function bulkListNFTs(address nftAddress, uint256[] calldata tokenIds, uint256[] calldata prices) external notPaused {
-        require(tokenIds.length == prices.length, "Mismatched input lengths");
-
-        for (uint256 i = 0; i < tokenIds.length; i++) {
-            require(prices[i] > 0, "Price must be greater than zero");
-            IERC721(nftAddress).transferFrom(msg.sender, address(this), tokenIds[i]);
-            listings[nftAddress][tokenIds[i]] = Listing(msg.sender, prices[i]);
-            emit NFTListed(nftAddress, tokenIds[i], msg.sender, prices[i]);
+    function bulkList(address nft, uint256[] calldata tokenIds, uint256[] calldata prices) external notPaused {
+        require(tokenIds.length == prices.length, "Input length mismatch");
+        for (uint i = 0; i < tokenIds.length; i++) {
+            require(prices[i] > 0, "Price > 0");
+            IERC721(nft).transferFrom(msg.sender, address(this), tokenIds[i]);
+            listings[nft][tokenIds[i]] = Listing(msg.sender, prices[i]);
+            emit NFTListed(nft, tokenIds[i], msg.sender, prices[i]);
         }
     }
 
-    function purchaseNFT(address nftAddress, uint256 tokenId) external payable nonReentrant isListed(nftAddress, tokenId) notPaused {
-        Listing memory item = listings[nftAddress][tokenId];
-        require(msg.value >= item.price, "Insufficient payment");
+    function cancelListing(address nft, uint256 tokenId) external onlySeller(nft, tokenId) {
+        delete listings[nft][tokenId];
+        IERC721(nft).transferFrom(address(this), msg.sender, tokenId);
+        emit NFTListingCancelled(nft, tokenId);
+    }
 
-        delete listings[nftAddress][tokenId];
+    function updateListingPrice(address nft, uint256 tokenId, uint256 newPrice) external onlySeller(nft, tokenId) {
+        require(newPrice > 0, "Price must be > 0");
+        listings[nft][tokenId].price = newPrice;
+        emit NFTPriceUpdated(nft, tokenId, newPrice);
+    }
 
-        payable(item.seller).transfer(item.price);
+    // === PURCHASE FUNCTION ===
 
-        if (msg.value > item.price) {
-            payable(msg.sender).transfer(msg.value - item.price);
+    function purchaseNFT(address nft, uint256 tokenId) external payable nonReentrant isListed(nft, tokenId) notPaused {
+        Listing memory listing = listings[nft][tokenId];
+        require(msg.value >= listing.price, "Underpaid");
+
+        uint256 feeAmount = (listing.price * feePercent) / 10000;
+        uint256 remaining = listing.price - feeAmount;
+
+        delete listings[nft][tokenId];
+
+        // Pay royalties if supported
+        try IERC2981(nft).royaltyInfo(tokenId, listing.price) returns (address royaltyReceiver, uint256 royaltyAmount) {
+            if (royaltyReceiver != address(0) && royaltyAmount > 0) {
+                payable(royaltyReceiver).transfer(royaltyAmount);
+                remaining -= royaltyAmount;
+            }
+        } catch {}
+
+        payable(listing.seller).transfer(remaining);
+        payable(feeRecipient).transfer(feeAmount);
+
+        if (msg.value > listing.price) {
+            payable(msg.sender).transfer(msg.value - listing.price); // refund excess
         }
 
-        IERC721(nftAddress).transferFrom(address(this), msg.sender, tokenId);
-        emit NFTPurchased(nftAddress, tokenId, msg.sender, item.price);
+        IERC721(nft).transferFrom(address(this), msg.sender, tokenId);
+        emit NFTPurchased(nft, tokenId, msg.sender, listing.price);
     }
 
-    function cancelListing(address nftAddress, uint256 tokenId) external onlySeller(nftAddress, tokenId) {
-        delete listings[nftAddress][tokenId];
-        IERC721(nftAddress).transferFrom(address(this), msg.sender, tokenId);
-        emit NFTListingCancelled(nftAddress, tokenId);
-    }
-
-    function updateListingPrice(address nftAddress, uint256 tokenId, uint256 newPrice) external onlySeller(nftAddress, tokenId) {
-        require(newPrice > 0, "Price must be greater than zero");
-        listings[nftAddress][tokenId].price = newPrice;
-        emit NFTPriceUpdated(nftAddress, tokenId, newPrice);
-    }
-
-    function getListing(address nftAddress, uint256 tokenId) external view returns (Listing memory) {
-        return listings[nftAddress][tokenId];
-    }
-
-    function isNFTListed(address nftAddress, uint256 tokenId) external view returns (bool) {
-        return listings[nftAddress][tokenId].seller != address(0);
-    }
+    // === ADMIN FUNCTIONS ===
 
     function pauseMarketplace() external onlyOwner {
         isPaused = true;
@@ -128,10 +149,32 @@ contract NFTMarketplace is ReentrancyGuard {
         emit MarketplaceUnpaused();
     }
 
+    function updateFee(uint256 newFee) external onlyOwner {
+        require(newFee <= 1000, "Max 10%");
+        feePercent = newFee;
+        emit FeeUpdated(newFee);
+    }
+
+    function updateFeeRecipient(address newRecipient) external onlyOwner {
+        require(newRecipient != address(0), "Zero address");
+        feeRecipient = newRecipient;
+        emit FeeRecipientUpdated(newRecipient);
+    }
+
     function withdraw() external onlyOwner {
-        uint256 balance = address(this).balance;
-        require(balance > 0, "Nothing to withdraw");
-        payable(owner).transfer(balance);
-        emit Withdrawn(owner, balance);
+        uint256 bal = address(this).balance;
+        require(bal > 0, "No ETH");
+        payable(owner).transfer(bal);
+        emit Withdrawn(owner, bal);
+    }
+
+    // === VIEW FUNCTIONS ===
+
+    function getListing(address nft, uint256 tokenId) external view returns (Listing memory) {
+        return listings[nft][tokenId];
+    }
+
+    function isNFTListed(address nft, uint256 tokenId) external view returns (bool) {
+        return listings[nft][tokenId].seller != address(0);
     }
 }
